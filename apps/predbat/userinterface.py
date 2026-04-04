@@ -318,6 +318,9 @@ class UserInterface:
                 self.log("select_event: {}, {} = {}".format(item["name"], entity, value))
                 if item["name"] == "update":
                     self.log("Calling update service for {}".format(value))
+                    # Manual update selection is treated as an explicit pin;
+                    # disable auto-update switch automatically.
+                    await self.async_expose_config("auto_update", False, event=True)
                     await self.async_download_predbat_version(value)
                 elif item["name"] == "saverestore":
                     if value == "save current":

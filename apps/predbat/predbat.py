@@ -38,23 +38,32 @@ import asyncio
 
 THIS_VERSION = "v8.35.5"
 
-from download import predbat_update_move, predbat_update_download, check_install, resolve_predbat_repository, DEFAULT_PREDBAT_REPOSITORY
+from download import predbat_update_move, predbat_update_download, check_install, resolve_predbat_repository, DEFAULT_PREDBAT_REPOSITORY, save_version_pin, load_version_pin, predbat_branch_update_required, get_github_ref_sha
 from const import MINUTE_WATT
 
 # Only do the self-install/self-update logic if we are NOT compiled.
 if not IS_COMPILED:
+    tracked_tag = (load_version_pin()).get("pinned_version")
+
+    effective_version = tracked_tag if tracked_tag else THIS_VERSION
+    effective_repository = DEFAULT_PREDBAT_REPOSITORY
+
+    if tracked_tag and not tracked_tag.startswith("v"):
+        effective_repository = resolve_predbat_repository(None)
+        print("Running from tracked branch '{}'".format(tracked_tag))
+
     # Sanity check the install and re-download if corrupted
-    passed, modified = check_install(THIS_VERSION, repository=DEFAULT_PREDBAT_REPOSITORY)
+    passed, modified = check_install(effective_version, repository=effective_repository)
     if not passed:
         print("Warn: Predbat files are not installed correctly, trying to download them")
-        files = predbat_update_download(THIS_VERSION, repository=DEFAULT_PREDBAT_REPOSITORY)
+        files = predbat_update_download(effective_version, repository=effective_repository)
         if files:
-            predbat_update_move(THIS_VERSION, files)
+            predbat_update_move(effective_version, files)
         sys.exit(1)
     elif modified:
         print("Warn: Predbat files are installed but have modifications")
     else:
-        print("Predbat files are installed correctly for version {}".format(THIS_VERSION))
+        print("Predbat files are installed correctly for version {}".format(effective_version))
 else:
     # In compiled mode, we skip the entire self-update logic
     print("Running in compiled mode; skipping local file checks and auto-update.")
@@ -153,12 +162,14 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
             found_latest_beta = False
 
             release = data[0]
-            self.releases["this"] = THIS_VERSION
+            current_version = (load_version_pin()).get("pinned_version") or THIS_VERSION
+
+            self.releases["this"] = current_version
             self.releases["latest"] = "Unknown"
             self.releases["latest_beta"] = "Unknown"
 
             for release in data:
-                if release.get("tag_name", "Unknown") == THIS_VERSION:
+                if release.get("tag_name", "Unknown") == current_version:
                     self.releases["this_name"] = release.get("name", "Unknown")
                     self.releases["this_body"] = release.get("body", "Unknown")
 
@@ -174,9 +185,9 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
                     self.releases["latest_beta_body"] = release.get("body", "Unknown")
                     found_latest_beta = True
 
-            self.log("Predbat {} repository {} version {} currently running, latest version is {}, latest beta is {}".format(__file__, repository, self.releases["this"], self.releases["latest"], self.releases["latest_beta"]))
+            self.log("Predbat {} repository {} pinned {} latest {} latest beta {}".format(__file__, repository, self.releases["this"], self.releases["latest"], self.releases["latest_beta"]))
             PREDBAT_UPDATE_OPTIONS = ["main"]
-            this_tag = THIS_VERSION
+            this_tag = current_version
             new_version = False
 
             # Find all versions for the dropdown menu
@@ -189,7 +200,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
                     else:
                         full_name = tag + " " + release.get("name", "")
                     PREDBAT_UPDATE_OPTIONS.append(full_name)
-                    if this_tag == tag:
+                    if current_version == tag:
                         this_tag = full_name
                 if len(PREDBAT_UPDATE_OPTIONS) >= 25:
                     break
@@ -200,24 +211,36 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
                 item["options"] = PREDBAT_UPDATE_OPTIONS
                 item["value"] = None
 
-            # See what version we are on and auto-update
+            # If pinned tag isn't visible in options, keep it visible with an unknown marker
             if this_tag not in PREDBAT_UPDATE_OPTIONS:
-                this_tag = this_tag + " (?)"
+                this_tag = current_version + " (?)"
                 PREDBAT_UPDATE_OPTIONS.append(this_tag)
                 self.log("Autoupdate: Currently on unknown version {}".format(this_tag))
-            else:
-                if self.releases["this"] == self.releases["latest"]:
-                    self.log("Autoupdate: Currently up to date")
-                elif self.releases["this"] == self.releases["latest_beta"]:
-                    self.log("Autoupdate: Currently on latest beta")
-                else:
-                    latest_version = self.releases["latest"] + " " + self.releases["latest_name"]
-                    if auto_update:
-                        self.log("Autoupdate: There is an update pending {} - auto update triggered!".format(latest_version))
-                        self.download_predbat_version(latest_version)
+
+            latest_version = self.releases["latest"] + " " + self.releases.get("latest_name", "")
+
+            # Auto-update follows switch state:
+            # - pinned branch (e.g. main): update to latest branch commit
+            # - pinned release tag: update pin to latest stable release
+            if auto_update:
+                if current_version and not current_version.startswith("v"):
+                    branch_repository = self.get_predbat_repository()
+                    pin_state = load_version_pin()
+                    resolved_sha = pin_state.get("resolved_sha")
+                    if predbat_branch_update_required(current_version, repository=branch_repository, resolved_sha=resolved_sha):
+                        self.log("Autoupdate: Branch {} has updates - auto update triggered".format(current_version))
+                        self.download_predbat_version(current_version, force=True)
                     else:
-                        self.log("Autoupdate: There is an update pending {} - auto update is off".format(latest_version))
-                        new_version = True
+                        self.log("Autoupdate: Branch {} already up to date".format(current_version))
+                elif self.releases["latest"] != "Unknown" and current_version != self.releases["latest"]:
+                    self.log("Autoupdate: Release pin {} behind latest {} - auto update triggered".format(current_version, self.releases["latest"]))
+                    self.download_predbat_version(latest_version)
+                else:
+                    self.log("Autoupdate: Release pin {} already up to date".format(current_version))
+            else:
+                if current_version.startswith("v") and self.releases["latest"] != "Unknown" and current_version != self.releases["latest"]:
+                    self.log("Autoupdate: There is an update pending {} - auto update is off".format(latest_version))
+                    new_version = True
 
             # Refresh the list
             self.expose_config("update", this_tag)
@@ -1136,13 +1159,13 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
         # This allows the power flow to update for the user more quickly.
         self.inverter_data_last_fetch = datetime.now() - timedelta(seconds=INVERTER_QUICK_UPDATE_SECONDS) + timedelta(seconds=30)
 
-    async def async_download_predbat_version(self, version):
+    async def async_download_predbat_version(self, version, force=False):
         """
         Sync wrapper for async download_predbat_version
         """
-        return await self.run_in_executor(self.download_predbat_version, version)
+        return await self.run_in_executor(self.download_predbat_version, version, force)
 
-    def download_predbat_version(self, version):
+    def download_predbat_version(self, version, force=False):
         """
         Download a version of Predbat from GitHub
 
@@ -1152,15 +1175,24 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
         Returns:
             bool: True if the download and update were successful, False otherwise.
         """
-        if version == THIS_VERSION:
-            self.log("Warn: Predbat update requested for the same version as we are running ({}), no update required".format(version))
-            return
-
         selected_tag = version.split(" ")[0] if version else ""
+        persisted_state = load_version_pin()
+        persisted_tag = persisted_state.get("pinned_version")
+        current_tag = persisted_tag or THIS_VERSION
+        if selected_tag == current_tag and not force:
+            # If the pin file is missing but user selected current version, persist the pin anyway.
+            if selected_tag and not persisted_tag:
+                save_version_pin(selected_tag)
+            self.log("Warn: Predbat update requested for already pinned version {}, no update required".format(version))
+            return
         if selected_tag == "main":
             repository = self.get_predbat_repository()
         else:
             repository = DEFAULT_PREDBAT_REPOSITORY
+
+        resolved_sha = None
+        if selected_tag and not selected_tag.startswith("v"):
+            resolved_sha = get_github_ref_sha(selected_tag, repository=repository)
 
         self.log("Update Predbat to version {} from repository {}".format(version, repository))
         self.expose_config("version", True, force=True, in_progress=True)
@@ -1187,6 +1219,11 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Execute, Outpu
             # Perform the update
             self.log("Perform the update.....")
             if predbat_update_move(version, files):
+                # Persist selected pin for both main and release tags.
+                # For branch pins, also persist resolved commit SHA.
+                if selected_tag:
+                    save_version_pin(selected_tag, resolved_sha=resolved_sha)
+
                 self.log("Update to version {} completed".format(version))
                 return True
             else:

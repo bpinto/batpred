@@ -19,8 +19,70 @@ import os
 import requests
 import yaml
 import hashlib
+import json
 
 DEFAULT_PREDBAT_REPOSITORY = "springfall2008/batpred"
+VERSION_PIN_FILENAME = ".predbat_version_pin"
+
+
+def get_version_pin_filepath():
+    """Return the path to the persisted version-pin file."""
+    return os.path.join(os.path.dirname(__file__), VERSION_PIN_FILENAME)
+
+
+def save_version_pin(version, resolved_sha=None):
+    """Persist selected version pin and optional resolved commit SHA.
+
+    Args:
+        version (str): Selected pin (e.g. "main" or "v8.35.5").
+        resolved_sha (str, optional): Resolved commit SHA for branch pins.
+    """
+    filepath = get_version_pin_filepath()
+
+    pinned_version = version.strip() if isinstance(version, str) else ""
+    if not pinned_version:
+        print("Warn: Failed to save version pin: empty version")
+        return False
+
+    normalized_sha = resolved_sha.strip() if isinstance(resolved_sha, str) else None
+    if normalized_sha == "":
+        normalized_sha = None
+
+    payload = {"pinned_version": pinned_version, "resolved_sha": normalized_sha}
+    try:
+        with open(filepath, "w") as f:
+            json.dump(payload, f)
+        print("Info: Saved version pin '{}' resolved_sha '{}'".format(pinned_version, normalized_sha))
+        return True
+    except Exception as e:
+        print("Warn: Failed to save version pin {}: {}".format(pinned_version, e))
+        return False
+
+
+def load_version_pin():
+    """Load version pin record, returning {} when unset or invalid."""
+    filepath = get_version_pin_filepath()
+    try:
+        if os.path.exists(filepath):
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                pinned_version = data.get("pinned_version")
+                if isinstance(pinned_version, str):
+                    pinned_version = pinned_version.strip()
+                else:
+                    pinned_version = ""
+
+                if pinned_version:
+                    resolved_sha = data.get("resolved_sha")
+                    if isinstance(resolved_sha, str):
+                        resolved_sha = resolved_sha.strip() or None
+                    else:
+                        resolved_sha = None
+                    return {"pinned_version": pinned_version, "resolved_sha": resolved_sha}
+    except Exception as e:
+        print("Warn: Failed to load version pin: {}".format(e))
+    return {}
 
 
 def resolve_predbat_repository(repository=None):
@@ -102,6 +164,51 @@ def compute_file_sha1(filepath):
     except Exception as e:
         print("Error: Failed to compute SHA1 for {}: {}".format(filepath, e))
         return None
+
+
+def get_github_ref_sha(ref, repository=None):
+    """Return commit SHA for a Git ref (branch/tag), or None on failure."""
+    repository = resolve_predbat_repository(repository)
+    url = "https://api.github.com/repos/{}/commits/{}".format(repository, ref)
+    try:
+        r = requests.get(url, headers={})
+        if r.ok:
+            data = r.json()
+            sha = data.get("sha")
+            if sha:
+                return sha
+        else:
+            print("Warn: Failed to fetch ref SHA for {} status {}".format(ref, r.status_code))
+    except Exception as e:
+        print("Warn: Failed to fetch ref SHA for {}: {}".format(ref, e))
+    return None
+
+
+def predbat_branch_update_required(version, repository=None, resolved_sha=None):
+    """Return True if a branch pin requires update.
+
+    Compares latest remote branch SHA to the last resolved SHA stored in the
+    version-pin file. Intended for branch pins (e.g. ``main``).
+    """
+    tag_split = version.split(" ")
+    if not tag_split:
+        return False
+    tag = tag_split[0]
+
+    # Only branch refs (e.g. main) are supported in this helper.
+    if not tag or tag.startswith("v"):
+        return False
+
+    latest_sha = get_github_ref_sha(tag, repository=repository)
+    if not latest_sha:
+        return False
+    if not resolved_sha:
+        print("Update required: no resolved SHA stored for branch {}".format(tag))
+        return True
+    if latest_sha != resolved_sha:
+        print("Update required: branch {} moved from {} to {}".format(tag, resolved_sha, latest_sha))
+        return True
+    return False
 
 
 def download_predbat_file_from_github(tag, filename, new_filename, repository=None):

@@ -15,6 +15,7 @@ import tempfile
 import shutil
 from unittest.mock import patch
 import yaml
+import asyncio
 
 # Add parent directory to path for standalone execution
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +31,10 @@ from download import (
     predbat_update_move,
     resolve_predbat_repository,
     DEFAULT_PREDBAT_REPOSITORY,
+    save_version_pin,
+    load_version_pin,
+    get_version_pin_filepath,
+    predbat_branch_update_required,
 )
 
 
@@ -79,6 +84,14 @@ def test_download(my_predbat):
         ("predbat_main_repo_override", _test_predbat_download_main_uses_configured_repository, "Predbat main update uses configured repository override"),
         ("predbat_tag_repo_upstream", _test_predbat_download_tag_uses_default_repository, "Predbat tagged update always uses upstream repository"),
         ("predbat_startup_pins_upstream", _test_predbat_startup_self_check_uses_default_repository, "Predbat startup self-check pins repository to upstream"),
+        ("version_pin_roundtrip", _test_version_pin_roundtrip, "Version pin file save/load/clear roundtrip"),
+        ("version_pin_malformed", _test_version_pin_malformed_json, "Malformed version pin file is handled safely"),
+        ("update_required_sha_diff", _test_predbat_branch_update_required_detects_sha_change, "Update-required check detects remote SHA mismatch"),
+        ("pin_saved_release", _test_predbat_download_saves_release_pin, "Downloading release saves release pin"),
+        ("pin_saved_main", _test_predbat_download_saves_main_pin, "Downloading main saves main pin"),
+        ("auto_update_main_force", _test_predbat_auto_update_main_branch_uses_force_update, "Auto-update main triggers forced main refresh when changes exist"),
+        ("auto_update_release_advances_pin", _test_predbat_auto_update_release_pin_advances_to_latest, "Auto-update release pin advances to latest release"),
+        ("select_update_turns_off_auto", _test_update_select_turns_off_auto_update, "Selecting update disables auto-update switch before download"),
     ]
 
     print("\n" + "=" * 70)
@@ -795,8 +808,9 @@ def _test_predbat_download_main_uses_configured_repository(my_predbat):
             return None
 
     dummy = DummyPredBat()
-    with patch("predbat.predbat_update_download", return_value=None) as mock_download:
-        predbat_module.PredBat.download_predbat_version(dummy, "main")
+    with patch("predbat.load_version_pin", return_value={"pinned_version": "v0.0.0"}):
+        with patch("predbat.predbat_update_download", return_value=None) as mock_download:
+            predbat_module.PredBat.download_predbat_version(dummy, "main")
         assert mock_download.called
         assert mock_download.call_args.kwargs.get("repository") == "example/forked-batpred"
     return 0
@@ -827,8 +841,9 @@ def _test_predbat_download_tag_uses_default_repository(my_predbat):
             return None
 
     dummy = DummyPredBat()
-    with patch("predbat.predbat_update_download", return_value=None) as mock_download:
-        predbat_module.PredBat.download_predbat_version(dummy, "v8.30.8")
+    with patch("predbat.load_version_pin", return_value={"pinned_version": "v0.0.0"}):
+        with patch("predbat.predbat_update_download", return_value=None) as mock_download:
+            predbat_module.PredBat.download_predbat_version(dummy, "v8.30.8")
         assert mock_download.called
         assert mock_download.call_args.kwargs.get("repository") == DEFAULT_PREDBAT_REPOSITORY
     return 0
@@ -836,22 +851,199 @@ def _test_predbat_download_tag_uses_default_repository(my_predbat):
 
 def _test_predbat_startup_self_check_uses_default_repository(my_predbat):
     """Test startup self-check/update pins repository to DEFAULT_PREDBAT_REPOSITORY at runtime."""
-    with patch("download.check_install", return_value=(False, False)) as mock_check_install:
-        with patch("download.predbat_update_download", return_value=["predbat.py"]) as mock_update_download:
-            with patch("download.predbat_update_move", return_value=True):
-                with patch("builtins.print"):
-                    with patch("sys.exit", side_effect=SystemExit):
-                        try:
-                            if "predbat" in sys.modules:
-                                importlib.reload(sys.modules["predbat"])
-                            else:
-                                importlib.import_module("predbat")
-                        except SystemExit:
-                            pass
+    with patch("download.load_version_pin", return_value={}):
+        with patch("download.check_install", return_value=(False, False)) as mock_check_install:
+            with patch("download.predbat_update_download", return_value=["predbat.py"]) as mock_update_download:
+                with patch("download.predbat_update_move", return_value=True):
+                    with patch("builtins.print"):
+                        with patch("sys.exit", side_effect=SystemExit):
+                            try:
+                                if "predbat" in sys.modules:
+                                    importlib.reload(sys.modules["predbat"])
+                                else:
+                                    importlib.import_module("predbat")
+                            except SystemExit:
+                                pass
 
     assert mock_check_install.called
     assert mock_check_install.call_args.kwargs.get("repository") == DEFAULT_PREDBAT_REPOSITORY
 
     assert mock_update_download.called
     assert mock_update_download.call_args.kwargs.get("repository") == DEFAULT_PREDBAT_REPOSITORY
+    return 0
+
+
+def _test_version_pin_roundtrip(my_predbat):
+    """Test persisted pin save/load lifecycle and manual file removal."""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        with patch("download.os.path.dirname", return_value=temp_dir):
+            assert load_version_pin() == {}
+
+            assert save_version_pin("main") is True
+            assert load_version_pin().get("pinned_version") == "main"
+
+            assert save_version_pin("v8.30.8") is True
+            assert load_version_pin().get("pinned_version") == "v8.30.8"
+
+            track_file = get_version_pin_filepath()
+            if os.path.exists(track_file):
+                os.remove(track_file)
+            assert load_version_pin() == {}
+    finally:
+        shutil.rmtree(temp_dir)
+    return 0
+
+
+def _test_version_pin_malformed_json(my_predbat):
+    """Test malformed version-pin JSON is handled gracefully with empty fallback."""
+    temp_dir = tempfile.mkdtemp()
+    try:
+        with patch("download.os.path.dirname", return_value=temp_dir):
+            with open(get_version_pin_filepath(), "w") as f:
+                f.write("{not:valid:json")
+
+            assert load_version_pin() == {}
+    finally:
+        shutil.rmtree(temp_dir)
+    return 0
+
+
+def _test_predbat_branch_update_required_detects_sha_change(my_predbat):
+    """Test update-required check returns True when branch head SHA differs."""
+    with patch("download.get_github_ref_sha", return_value="new_sha_123"):
+        assert predbat_branch_update_required("main", repository="example/repo", resolved_sha="old_sha_456") is True
+    return 0
+
+
+def _make_dummy_predbat_for_download_tests(auto_update=False):
+    """Create lightweight dummy object with methods used by PredBat update methods."""
+
+    class DummyPredBat:
+        def __init__(self):
+            self.stop_thread = False
+            self.pool = None
+            self.config_index = {}
+            self.download_calls = []
+
+        def log(self, *_args, **_kwargs):
+            return None
+
+        def expose_config(self, *_args, **_kwargs):
+            return None
+
+        def get_arg(self, name=None, *_args, **_kwargs):
+            if name == "auto_update":
+                return auto_update
+            return False
+
+        def get_predbat_repository(self):
+            return "example/forked-batpred"
+
+        def call_notify(self, *_args, **_kwargs):
+            return None
+
+        def download_predbat_releases_url(self, _url):
+            return [
+                {"tag_name": "v8.31.0", "name": "Release 8.31.0", "body": "latest", "prerelease": False},
+                {"tag_name": "v8.30.0", "name": "Release 8.30.0", "body": "older", "prerelease": False},
+            ]
+
+        def download_predbat_version(self, version, force=False):
+            self.download_calls.append((version, force))
+            return True
+
+    return DummyPredBat()
+
+
+def _test_predbat_download_saves_release_pin(my_predbat):
+    """Test manual release download persists release tag pin."""
+    predbat_module = _import_predbat_module_for_tests()
+    dummy = _make_dummy_predbat_for_download_tests()
+
+    with patch("predbat.load_version_pin", return_value={"pinned_version": "v8.30.0"}):
+        with patch("predbat.predbat_update_download", return_value=["predbat.py"]):
+            with patch("predbat.predbat_update_move", return_value=True):
+                with patch("predbat.save_version_pin") as mock_save:
+                    predbat_module.PredBat.download_predbat_version(dummy, "v8.31.0 Release 8.31.0")
+                    mock_save.assert_called_once_with("v8.31.0", resolved_sha=None)
+    return 0
+
+
+def _test_predbat_download_saves_main_pin(my_predbat):
+    """Test manual main download persists main pin."""
+    predbat_module = _import_predbat_module_for_tests()
+    dummy = _make_dummy_predbat_for_download_tests()
+
+    with patch("predbat.load_version_pin", return_value={"pinned_version": "v8.30.0"}):
+        with patch("predbat.get_github_ref_sha", return_value="abc123"):
+            with patch("predbat.predbat_update_download", return_value=["predbat.py"]):
+                with patch("predbat.predbat_update_move", return_value=True):
+                    with patch("predbat.save_version_pin") as mock_save:
+                        predbat_module.PredBat.download_predbat_version(dummy, "main")
+                        mock_save.assert_called_once_with("main", resolved_sha="abc123")
+    return 0
+
+
+def _test_predbat_auto_update_main_branch_uses_force_update(my_predbat):
+    """Test auto-update on pinned main triggers forced branch update when changes exist."""
+    predbat_module = _import_predbat_module_for_tests()
+    dummy = _make_dummy_predbat_for_download_tests(auto_update=True)
+
+    with patch("predbat.load_version_pin", return_value={"pinned_version": "main", "resolved_sha": "old_sha"}):
+        with patch("predbat.predbat_branch_update_required", return_value=True):
+            predbat_module.PredBat.download_predbat_releases(dummy)
+
+    assert len(dummy.download_calls) == 1
+    assert dummy.download_calls[0][0] == "main"
+    assert dummy.download_calls[0][1] is True
+    return 0
+
+
+def _test_predbat_auto_update_release_pin_advances_to_latest(my_predbat):
+    """Test auto-update on pinned release advances to latest stable release tag."""
+    predbat_module = _import_predbat_module_for_tests()
+    dummy = _make_dummy_predbat_for_download_tests(auto_update=True)
+
+    with patch("predbat.load_version_pin", return_value={"pinned_version": "v8.30.0"}):
+        predbat_module.PredBat.download_predbat_releases(dummy)
+
+    assert len(dummy.download_calls) == 1
+    assert dummy.download_calls[0][0].startswith("v8.31.0")
+    assert dummy.download_calls[0][1] is False
+    return 0
+
+
+def _test_update_select_turns_off_auto_update(my_predbat):
+    """Test selecting predbat update toggles auto_update switch off before downloading."""
+    ui_module = importlib.import_module("userinterface")
+
+    class DummyComponents:
+        async def select_event(self, *_args, **_kwargs):
+            return None
+
+    class DummyUI:
+        def __init__(self):
+            self.components = DummyComponents()
+            self.CONFIG_ITEMS = [{"name": "update", "entity": "select.predbat_update"}]
+            self.update_pending = False
+            self.plan_valid = True
+            self.calls = []
+
+        def log(self, *_args, **_kwargs):
+            return None
+
+        async def async_expose_config(self, name, value, **_kwargs):
+            self.calls.append(("expose", name, value))
+
+        async def async_download_predbat_version(self, value):
+            self.calls.append(("download", value))
+
+    dummy = DummyUI()
+    event_data = {"service_data": {"option": "main", "entity_id": ["select.predbat_update"]}}
+
+    asyncio.run(ui_module.UserInterface.select_event(dummy, "event", event_data, {}))
+
+    assert dummy.calls[0] == ("expose", "auto_update", False)
+    assert dummy.calls[1] == ("download", "main")
     return 0
